@@ -1,7 +1,9 @@
 # AI Scanner — Ollama
 
-Herramienta para localizar servidores Ollama expuestos con Shodan y trabajar
-con ellos. Incluye:
+Herramienta para localizar servidores de IA expuestos (sin autenticación) con
+Shodan y trabajar con ellos. Soporta **Ollama** y servidores compatibles con
+la API de **OpenAI** (llama.cpp, vLLM, LocalAI, LM Studio, text-gen-webui).
+Incluye:
 
 - **[find_ollama.py](find_ollama.py)** — scanner de línea de comandos (búsqueda,
   pruebas de velocidad y chat).
@@ -24,11 +26,17 @@ source venv/bin/activate
 pip install shodan requests python-dotenv textual
 ```
 
-Crea un fichero `.env` en la raíz con tu clave de Shodan:
+Crea un fichero `.env` en la raíz con tu clave de Shodan y, opcionalmente, el
+número de hilos para las pruebas de modelos:
 
 ```
 SHODAN_API_KEY=tu_clave_aqui
+TEST_THREADS=20              # hilos para --test / tecla t en la TUI (def: 10)
 ```
+
+Las pruebas de modelos (`--test` en la CLI y la tecla `t` en la TUI) se ejecutan
+en paralelo con ese número de hilos, así que terminan mucho antes. En la CLI se
+puede sobrescribir con `--test-workers N`.
 
 ---
 
@@ -54,11 +62,37 @@ python find_ollama.py --chat          # elige modelo y servidor e inicia un chat
 | `--test-timeout`  | Timeout por prueba en `--test` (def: 60 s).                     |
 | `--num-predict`   | Tokens a generar en cada prueba (def: 16).                      |
 | `--test-workers`  | Pruebas en paralelo en `--test` (def: 10).                      |
+| `--providers`     | Proveedores a buscar, separados por comas, o `all` (def: all).  |
 
 Los resultados se cachean en **`ollama_hosts.json`**. Cualquier ejecución
 reutiliza esa caché; solo `--update` (o su ausencia inicial) consulta Shodan.
 Los datos de `--test` también se guardan, así que los colores de estado se
 mantienen entre ejecuciones.
+
+### Proveedores soportados
+
+Además de Ollama, busca otros servidores de IA que suelen exponerse **sin
+autenticación**. Los que hablan la API compatible con OpenAI comparten los
+endpoints `/v1/models` y `/v1/chat/completions`:
+
+| Proveedor    | Protocolo | Puerto | Notas                                       |
+| ------------ | --------- | ------ | ------------------------------------------- |
+| `ollama`     | Ollama    | 11434  | API nativa (`/api/tags`, `/api/chat`).      |
+| `llamacpp`   | OpenAI    | 8080   | `llama-server`; fingerprint fiable.         |
+| `vllm`       | OpenAI    | 8000   | Fingerprint aproximado (se confirma al sondear). |
+| `localai`    | OpenAI    | 8080   | Cabecera `Server: LocalAI`.                 |
+| `lmstudio`   | OpenAI    | 1234   | Fingerprint débil.                          |
+| `tgwebui`    | OpenAI    | 5000   | text-generation-webui (oobabooga).          |
+
+```bash
+python find_ollama.py --update --providers ollama,vllm,llamacpp   # solo estos
+python find_ollama.py --update --providers all                     # todos (def)
+```
+
+> Las consultas de Shodan de algunos proveedores son aproximadas; la
+> confirmación real de que es un servidor válido y su lista de modelos se hace
+> al sondear el host en vivo. Puedes afinar las consultas editando el
+> diccionario `PROVIDERS` en [find_ollama.py](find_ollama.py).
 
 ---
 

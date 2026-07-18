@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Busca servidores Ollama expuestos usando la API de Shodan y lista, por
-cada IP, los modelos disponibles.
+"""Busca servidores de IA expuestos (sin autenticación) usando la API de
+Shodan y lista, por cada IP, los modelos disponibles.
+
+Soporta varios proveedores (ver PROVIDERS): Ollama y servidores compatibles
+con la API de OpenAI (llama.cpp, vLLM, LocalAI, LM Studio, text-gen-webui).
 
 Uso:
     python find_ollama.py [--limit N] [--no-probe] [--timeout S]
-    python find_ollama.py --update          # refresca la caché desde Shodan
-    python find_ollama.py --chat            # chatea usando la caché existente
+    python find_ollama.py --update                 # refresca la caché desde Shodan
+    python find_ollama.py --providers ollama,vllm  # solo ciertos proveedores
+    python find_ollama.py --chat                   # chatea usando la caché
+    python find_ollama.py --test                   # prueba y mide velocidad
 
 Los resultados se guardan en ollama_hosts.json. En modo --chat (o cualquier
 ejecución normal) se reutiliza esa caché si existe; con --update se vuelve a
@@ -26,9 +31,49 @@ from dotenv import load_dotenv
 
 import shodan
 
-# Query de Shodan: Ollama escucha por defecto en el puerto 11434 y su
-# servidor HTTP responde con la cabecera "Server: ollama".
-SHODAN_QUERY = 'product:Ollama port:11434'
+# Servidores de IA que suelen exponerse sin autenticación. Cada proveedor
+# define su consulta de Shodan, el puerto por defecto y el "protocolo" con el
+# que hablamos con él para listar modelos / chatear / probar:
+#   - "ollama": API nativa de Ollama (/api/tags, /api/chat, /api/generate).
+#   - "openai": API compatible con OpenAI (/v1/models, /v1/chat/completions).
+# Las consultas de Shodan de algunos (vLLM, LM Studio, text-gen-webui) son
+# aproximadas; la confirmación real se hace al sondear el host. Edítalas si
+# quieres afinar la búsqueda.
+PROVIDERS = {
+    "ollama": {
+        "query": 'product:Ollama',
+        "protocol": "ollama",
+        "port": 11434,
+    },
+    "llamacpp": {
+        "query": '"Server: llama.cpp"',
+        "protocol": "openai",
+        "port": 8080,
+    },
+    "vllm": {
+        "query": 'html:"vllm" "HTTP/1.1 200"',
+        "protocol": "openai",
+        "port": 8000,
+    },
+    "localai": {
+        "query": '"Server: LocalAI"',
+        "protocol": "openai",
+        "port": 8080,
+    },
+    "lmstudio": {
+        "query": 'port:1234 "Content-Type: application/json" "access-control-allow-origin"',
+        "protocol": "openai",
+        "port": 1234,
+    },
+    "tgwebui": {
+        "query": 'port:5000 "openai" "HTTP/1.1 200"',
+        "protocol": "openai",
+        "port": 5000,
+    },
+}
+
+# Query heredada (solo Ollama), por compatibilidad con la caché antigua.
+SHODAN_QUERY = PROVIDERS["ollama"]["query"]
 
 # Fichero donde se cachean los resultados de la búsqueda.
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -53,6 +98,16 @@ def load_cache(path: str = CACHE_FILE):
         return None
 
 
+def env_test_threads(default: int = 10) -> int:
+    """Número de hilos para las pruebas de modelos, leído de TEST_THREADS
+    (fichero .env o entorno). Si no está o es inválido, usa `default`."""
+    load_dotenv()
+    try:
+        return max(1, int(os.getenv("TEST_THREADS", default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def get_test(host: dict, model: str):
     """Devuelve el resultado de --test guardado para (host, modelo), o None."""
     return (host.get("tests") or {}).get(model)
@@ -70,29 +125,37 @@ def server_speed_key(host: dict, model: str):
     return (1, t.get("latency") or 9999.0)
 
 
-def get_models_from_host(ip: str, port: int, timeout: float):
-    """Consulta directamente /api/tags del host para obtener la lista de
-    modelos. Devuelve una lista de nombres o None si no responde."""
-    url = f"http://{ip}:{port}/api/tags"
+def get_models_from_host(ip: str, port: int, timeout: float, protocol: str = "ollama"):
+    """Consulta el endpoint de listado de modelos del host según su protocolo.
+    Devuelve una lista de nombres, [] si responde pero sin modelos, o None si
+    no responde / no es un servidor válido."""
+    if protocol == "openai":
+        url = f"http://{ip}:{port}/v1/models"
+        key = "id"
+        container = "data"
+    else:  # ollama
+        url = f"http://{ip}:{port}/api/tags"
+        key = "name"
+        container = "models"
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
-        return [m.get("name", "?") for m in data.get("models", [])]
+        return [m.get(key, "?") for m in data.get(container, [])]
     except Exception:
         return None
 
 
-def models_from_shodan_banner(match: dict):
-    """Intenta extraer los modelos que Shodan ya haya capturado en el banner
-    (algunos hosts exponen /api/tags en los datos indexados)."""
+def models_from_shodan_banner(match: dict, protocol: str = "ollama"):
+    """Intenta extraer los modelos que Shodan ya haya capturado en el banner.
+    Ollama usa "name" (en "models"); la API OpenAI usa "id" (en "data")."""
+    import re
     data = match.get("data", "") or ""
+    field = "id" if protocol == "openai" else "name"
     models = []
-    if '"models"' in data and '"name"' in data:
-        import re
-        for name in re.findall(r'"name"\s*:\s*"([^"]+)"', data):
-            if name not in models:
-                models.append(name)
+    for name in re.findall(rf'"{field}"\s*:\s*"([^"]+)"', data):
+        if name not in models:
+            models.append(name)
     return models
 
 
@@ -120,11 +183,16 @@ def select_from_list(items, render, prompt):
         print("    Selección no válida.")
 
 
-def chat_stream_iter(host_url: str, model: str, messages: list, timeout: float):
-    """Generador que envía la conversación a /api/chat en streaming y va
-    cediendo (yield) cada fragmento de texto del asistente. Si hay un error,
-    cede una tupla ("__error__", mensaje). Reutilizable por CLI y TUI."""
-    url = f"{host_url}/api/chat"
+def chat_stream_iter(host_url: str, model: str, messages: list, timeout: float,
+                     protocol: str = "ollama"):
+    """Generador que envía la conversación en streaming y va cediendo (yield)
+    cada fragmento de texto del asistente. Si hay un error, cede una tupla
+    ("__error__", mensaje). Soporta el protocolo nativo de Ollama y el
+    compatible con OpenAI. Reutilizable por CLI y TUI."""
+    if protocol == "openai":
+        url = f"{host_url}/v1/chat/completions"
+    else:
+        url = f"{host_url}/api/chat"
     payload = {"model": model, "messages": messages, "stream": True}
     try:
         resp = requests.post(url, json=payload, stream=True, timeout=timeout)
@@ -136,26 +204,46 @@ def chat_stream_iter(host_url: str, model: str, messages: list, timeout: float):
     for line in resp.iter_lines():
         if not line:
             continue
-        try:
-            chunk = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if "error" in chunk:
-            yield ("__error__", f"error del servidor: {chunk['error']}")
-            return
-        piece = chunk.get("message", {}).get("content", "")
-        if piece:
-            yield piece
-        if chunk.get("done"):
-            break
+
+        if protocol == "openai":
+            # Server-Sent Events: líneas "data: {json}" y "data: [DONE]".
+            text = line.decode("utf-8", "replace") if isinstance(line, bytes) else line
+            if not text.startswith("data:"):
+                continue
+            text = text[len("data:"):].strip()
+            if text == "[DONE]":
+                break
+            try:
+                chunk = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            choices = chunk.get("choices") or [{}]
+            piece = (choices[0].get("delta") or {}).get("content", "")
+            if piece:
+                yield piece
+        else:
+            # Ollama: una línea JSON por fragmento.
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "error" in chunk:
+                yield ("__error__", f"error del servidor: {chunk['error']}")
+                return
+            piece = chunk.get("message", {}).get("content", "")
+            if piece:
+                yield piece
+            if chunk.get("done"):
+                break
 
 
-def chat_stream(host_url: str, model: str, messages: list, timeout: float):
+def chat_stream(host_url: str, model: str, messages: list, timeout: float,
+                protocol: str = "ollama"):
     """Versión CLI: imprime la respuesta en streaming. Devuelve el texto
     completo del asistente o None si falla."""
     full = []
     try:
-        for piece in chat_stream_iter(host_url, model, messages, timeout):
+        for piece in chat_stream_iter(host_url, model, messages, timeout, protocol):
             if isinstance(piece, tuple):  # ("__error__", msg)
                 print(f"    [{piece[1]}]")
                 return None
@@ -167,23 +255,35 @@ def chat_stream(host_url: str, model: str, messages: list, timeout: float):
     return "".join(full)
 
 
-def test_model(ip: str, port: int, model: str, timeout: float, num_predict: int):
+def test_model(ip: str, port: int, model: str, timeout: float, num_predict: int,
+               protocol: str = "ollama"):
     """Envía una generación mínima a un modelo y mide su rendimiento.
 
     Devuelve un dict con:
       ok            -> True/False
       latency       -> tiempo total de la petición (s)
-      tokens_per_sec-> velocidad de generación según métricas de Ollama
+      tokens_per_sec-> velocidad de generación (métricas del servidor si las
+                       hay; si no, tokens generados / latencia)
       eval_count    -> nº de tokens generados
       error         -> descripción si ok=False
     """
-    url = f"http://{ip}:{port}/api/generate"
-    payload = {
-        "model": model,
-        "prompt": "Responde solo con la palabra: OK",
-        "stream": False,
-        "options": {"num_predict": num_predict},
-    }
+    prompt = "Responde solo con la palabra: OK"
+    if protocol == "openai":
+        url = f"http://{ip}:{port}/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "max_tokens": num_predict,
+        }
+    else:
+        url = f"http://{ip}:{port}/api/generate"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": num_predict},
+        }
     t0 = time.perf_counter()
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
@@ -196,11 +296,19 @@ def test_model(ip: str, port: int, model: str, timeout: float, num_predict: int)
 
     latency = time.perf_counter() - t0
     if isinstance(data, dict) and data.get("error"):
-        return {"ok": False, "error": str(data["error"])[:60], "latency": latency}
+        err = data["error"]
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        return {"ok": False, "error": str(msg)[:60], "latency": latency}
 
-    eval_count = data.get("eval_count") or 0
-    eval_dur = data.get("eval_duration") or 0  # nanosegundos
-    tps = (eval_count / (eval_dur / 1e9)) if eval_dur else None
+    if protocol == "openai":
+        # La API OpenAI no da tiempos de servidor; estimamos tok/s con la latencia.
+        usage = data.get("usage") or {}
+        eval_count = usage.get("completion_tokens") or 0
+        tps = (eval_count / latency) if (eval_count and latency) else None
+    else:
+        eval_count = data.get("eval_count") or 0
+        eval_dur = data.get("eval_duration") or 0  # nanosegundos
+        tps = (eval_count / (eval_dur / 1e9)) if eval_dur else None
     return {
         "ok": True,
         "latency": latency,
@@ -229,7 +337,8 @@ def run_tests(hosts, timeout: float, num_predict: int, workers: int):
 
     def work(pair):
         h, m = pair
-        res = test_model(h["ip"], h["port"], m, timeout, num_predict)
+        res = test_model(h["ip"], h["port"], m, timeout, num_predict,
+                         h.get("protocol", "ollama"))
         return h, m, res
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -345,11 +454,13 @@ def start_chat(hosts, default_timeout: float):
             return
 
     host_url = f"http://{host['ip']}:{host['port']}"
+    protocol = host.get("protocol", "ollama")
     # Timeout más generoso para la generación que para el sondeo inicial.
     chat_timeout = max(default_timeout, 120.0)
 
     print("\n" + "=" * 70)
-    print(f"Chat con {model} @ {host['ip']}:{host['port']}")
+    print(f"Chat con {model} @ {host['ip']}:{host['port']} "
+          f"[{host.get('provider', 'ollama')}]")
     print("Escribe tu mensaje. Comandos: /reset (limpiar contexto), /salir")
     print("=" * 70)
 
@@ -370,7 +481,7 @@ def start_chat(hosts, default_timeout: float):
 
         messages.append({"role": "user", "content": user_msg})
         print()
-        reply = chat_stream(host_url, model, messages, chat_timeout)
+        reply = chat_stream(host_url, model, messages, chat_timeout, protocol)
         if reply is None:
             # Deshacer el último mensaje para poder reintentar.
             messages.pop()
@@ -380,39 +491,59 @@ def start_chat(hosts, default_timeout: float):
     print("\nSesión de chat finalizada.")
 
 
-def fetch_from_shodan(limit: int, no_probe: bool, timeout: float):
-    """Consulta Shodan, sondea los hosts en vivo y devuelve la lista de hosts."""
+def fetch_from_shodan(limit: int, no_probe: bool, timeout: float, providers=None):
+    """Consulta Shodan para cada proveedor seleccionado, sondea los hosts en
+    vivo y devuelve una lista unificada de hosts (con su protocolo/proveedor).
+
+    `providers` es una lista de claves de PROVIDERS; None = todos."""
     load_dotenv()
     api_key = os.getenv("SHODAN_API_KEY")
     if not api_key:
         sys.exit("ERROR: no se encontró SHODAN_API_KEY en el entorno ni en .env")
 
     api = shodan.Shodan(api_key)
-
-    print(f"[*] Buscando servidores Ollama en Shodan: {SHODAN_QUERY!r}")
-    try:
-        results = api.search(SHODAN_QUERY, limit=limit)
-    except shodan.APIError as e:
-        sys.exit(f"ERROR de Shodan: {e}")
-
-    total = results.get("total", 0)
-    matches = results.get("matches", [])
-    print(f"[*] Total en Shodan: {total}. Procesando {len(matches)} resultados.\n")
+    selected = providers or list(PROVIDERS.keys())
 
     hosts = []
-    for m in matches:
-        hosts.append({
-            "ip": m.get("ip_str"),
-            "port": m.get("port", 11434),
-            "org": m.get("org", ""),
-            "country": (m.get("location", {}) or {}).get("country_name", ""),
-            "shodan_models": models_from_shodan_banner(m),
-        })
+    seen = set()  # dedup por ip:port
+    for name in selected:
+        prov = PROVIDERS.get(name)
+        if not prov:
+            print(f"[!] Proveedor desconocido: {name} (ignorado)")
+            continue
+        query, protocol = prov["query"], prov["protocol"]
+        print(f"[*] [{name}] Buscando en Shodan: {query!r}")
+        try:
+            results = api.search(query, limit=limit)
+        except shodan.APIError as e:
+            print(f"    [!] Error de Shodan para {name}: {e} (se omite)")
+            continue
+
+        matches = results.get("matches", [])
+        print(f"    total {results.get('total', 0)}, procesando {len(matches)}")
+        for m in matches:
+            ip, port = m.get("ip_str"), m.get("port", prov["port"])
+            key = f"{ip}:{port}"
+            if key in seen:
+                continue
+            seen.add(key)
+            hosts.append({
+                "ip": ip,
+                "port": port,
+                "provider": name,
+                "protocol": protocol,
+                "org": m.get("org", ""),
+                "country": (m.get("location", {}) or {}).get("country_name", ""),
+                "shodan_models": models_from_shodan_banner(m, protocol),
+            })
+
+    print(f"\n[*] {len(hosts)} servidores únicos encontrados.\n")
 
     # Consultar modelos en vivo (en paralelo) salvo que se pida --no-probe
     if not no_probe:
         def probe(h):
-            h["live_models"] = get_models_from_host(h["ip"], h["port"], timeout)
+            h["live_models"] = get_models_from_host(
+                h["ip"], h["port"], timeout, h.get("protocol", "ollama"))
             return h
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
@@ -434,7 +565,8 @@ def print_listing(hosts: list):
         if models:
             activos += 1
         loc = ", ".join(x for x in (h["country"], h["org"]) if x)
-        print(f"\nIP: {h['ip']}:{h['port']}  [{estado}]")
+        prov = h.get("provider", "ollama")
+        print(f"\nIP: {h['ip']}:{h['port']}  [{prov}] [{estado}]")
         if loc:
             print(f"    {loc}")
         if models:
@@ -448,7 +580,8 @@ def print_listing(hosts: list):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Busca servidores Ollama con Shodan")
+    parser = argparse.ArgumentParser(
+        description="Busca servidores de IA (Ollama, vLLM, llama.cpp…) con Shodan")
     parser.add_argument("--limit", type=int, default=100,
                         help="Número máximo de resultados a procesar (def: 100)")
     parser.add_argument("--no-probe", action="store_true",
@@ -465,9 +598,18 @@ def main():
                         help="Timeout por prueba de modelo en --test (def: 60)")
     parser.add_argument("--num-predict", type=int, default=16,
                         help="Tokens a generar en cada prueba de --test (def: 16)")
-    parser.add_argument("--test-workers", type=int, default=10,
-                        help="Pruebas en paralelo en --test (def: 10)")
+    parser.add_argument("--test-workers", type=int, default=None,
+                        help="Pruebas en paralelo en --test "
+                             "(def: TEST_THREADS del .env, o 10)")
+    parser.add_argument("--providers", default="all",
+                        help="Proveedores a buscar, separados por comas "
+                             f"({', '.join(PROVIDERS)}) o 'all' (def: all)")
     args = parser.parse_args()
+
+    if args.providers.strip().lower() == "all":
+        providers = list(PROVIDERS.keys())
+    else:
+        providers = [p.strip() for p in args.providers.split(",") if p.strip()]
 
     if args.chat and args.no_probe:
         print("[!] --chat requiere sondear los hosts; ignorando --no-probe.")
@@ -481,7 +623,7 @@ def main():
     if args.update or cached is None:
         if cached is None and not args.update:
             print("[*] No existe caché; consultando Shodan por primera vez.")
-        hosts = fetch_from_shodan(args.limit, args.no_probe, args.timeout)
+        hosts = fetch_from_shodan(args.limit, args.no_probe, args.timeout, providers)
         save_cache(hosts)
         print(f"[*] Resultados guardados en {CACHE_FILE}")
     else:
@@ -492,7 +634,8 @@ def main():
     print_listing(hosts)
 
     if args.test:
-        run_tests(hosts, args.test_timeout, args.num_predict, args.test_workers)
+        workers = args.test_workers or env_test_threads()
+        run_tests(hosts, args.test_timeout, args.num_predict, workers)
         # Persistir los resultados de las pruebas en la caché.
         save_cache(hosts)
         print(f"\n[*] Resultados de las pruebas guardados en {CACHE_FILE}")

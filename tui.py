@@ -12,6 +12,9 @@ Uso:
 
 Reutiliza la lógica de find_ollama.py (caché, Shodan, pruebas, streaming).
 """
+import concurrent.futures
+import threading
+
 from rich.markdown import Markdown
 from rich.text import Text
 from textual import on, work
@@ -45,6 +48,9 @@ def looks_like_markdown(text: str) -> bool:
 
 CHAT_TIMEOUT = 120.0
 
+# Ciclo del filtro por proveedor: None (todos) + cada proveedor conocido.
+PROVIDER_CYCLE = [None] + list(fo.PROVIDERS.keys())
+
 
 class ModelItem(ListItem):
     """Elemento de la lista de modelos. Se pinta en verde si al menos un
@@ -60,7 +66,8 @@ class ServerItem(ListItem):
     para el modelo seleccionado, el estado (rojo si falla) y la velocidad."""
     def __init__(self, host: dict, model: str | None = None):
         self.host = host
-        base = f"{host['ip']}:{host['port']}"
+        prov = host.get("provider", "ollama")
+        base = f"{host['ip']}:{host['port']} [dim]({prov})[/dim]"
         loc = f" · {host['country']}" if host.get("country") else ""
         t = fo.get_test(host, model) if model else None
         if t is None:
@@ -109,6 +116,7 @@ class OllamaTUI(App):
         Binding("u", "update", "Actualizar"),
         Binding("t", "test", "Probar"),
         Binding("o", "toggle_working", "Solo disponibles"),
+        Binding("p", "cycle_provider", "Proveedor"),
         Binding("r", "reset", "Reset chat"),
         Binding("ctrl+l", "clear", "Limpiar log"),
         Binding("q", "quit", "Salir"),
@@ -140,6 +148,9 @@ class OllamaTUI(App):
         self.bg_busy: str | None = None
         # Si True, oculta modelos/servidores que no han pasado la prueba.
         self.only_working = False
+        # Proveedor por el que filtrar (None = todos). Afecta a las listas y a
+        # qué se busca al actualizar.
+        self.provider_filter: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -181,7 +192,8 @@ class OllamaTUI(App):
             "[cyan]Ctrl+B[/cyan] modelo/servidor resaltado"
         )
         self.write_log(
-            "[b]Filtrar:[/b] [cyan]o[/cyan] mostrar solo disponibles (verde) / todos"
+            "[b]Filtrar:[/b] [cyan]o[/cyan] solo disponibles (verde) · "
+            "[cyan]p[/cyan] proveedor (Ollama, vLLM, llama.cpp…)"
         )
         self.query_one("#prompt", Input).focus()
 
@@ -194,6 +206,13 @@ class OllamaTUI(App):
         self.models = sorted(self.model_hosts.keys(),
                              key=lambda m: (-len(self.model_hosts[m]), m.lower()))
 
+    def _hosts_for(self, model: str) -> list:
+        """Servidores que ofrecen el modelo, aplicando el filtro de proveedor."""
+        hs = self.model_hosts.get(model, [])
+        if self.provider_filter:
+            hs = [h for h in hs if h.get("provider", "ollama") == self.provider_filter]
+        return hs
+
     def populate_models(self, filter_text: str = ""):
         lv = self.query_one("#models", ListView)
         lv.clear()
@@ -201,18 +220,20 @@ class OllamaTUI(App):
         for m in self.models:
             if ft and ft not in m.lower():
                 continue
-            working = any((fo.get_test(h, m) or {}).get("ok")
-                          for h in self.model_hosts[m])
+            hs = self._hosts_for(m)
+            if not hs:  # ningún servidor de ese proveedor ofrece este modelo
+                continue
+            working = any((fo.get_test(h, m) or {}).get("ok") for h in hs)
             # Con "solo disponibles" activo, ocultar los que no funcionan.
             if self.only_working and not working:
                 continue
-            lv.append(ModelItem(m, len(self.model_hosts[m]), working))
+            lv.append(ModelItem(m, len(hs), working))
 
     def populate_servers(self, model: str):
         lv = self.query_one("#servers", ListView)
         lv.clear()
         # Ordenados por velocidad: más rápido primero, fallos/no probados al final.
-        candidates = sorted(self.model_hosts.get(model, []),
+        candidates = sorted(self._hosts_for(model),
                             key=lambda h: fo.server_speed_key(h, model))
         for h in candidates:
             # Con "solo disponibles" activo, mostrar solo los que pasan la prueba.
@@ -280,8 +301,10 @@ class OllamaTUI(App):
     def stream_reply(self):
         worker = get_current_worker()
         host_url = f"http://{self.host['ip']}:{self.host['port']}"
+        protocol = self.host.get("protocol", "ollama")
         parts = []
-        for piece in fo.chat_stream_iter(host_url, self.model, self.messages, CHAT_TIMEOUT):
+        for piece in fo.chat_stream_iter(host_url, self.model, self.messages,
+                                         CHAT_TIMEOUT, protocol):
             if worker.is_cancelled:
                 break
             if isinstance(piece, tuple):  # ("__error__", msg)
@@ -323,6 +346,8 @@ class OllamaTUI(App):
 
     @work(thread=True, exclusive=True, group="update")
     def do_update(self):
+        # Siempre busca todos los proveedores; el filtro de proveedor ([p]) es
+        # solo para la vista, así una actualización nunca pierde los demás.
         try:
             hosts = fo.fetch_from_shodan(limit=100, no_probe=False, timeout=5.0)
         except SystemExit as e:
@@ -351,14 +376,30 @@ class OllamaTUI(App):
         usables = [h for h in self.hosts if h.get("live_models")]
         pairs = [(h, m) for h in usables for m in h["live_models"]]
         total = len(pairs)
-        self.call_from_thread(self.write_log, f"[bold]── Probando {total} modelos ──[/bold]")
+        workers = fo.env_test_threads()
+        self.call_from_thread(
+            self.write_log,
+            f"[bold]── Probando {total} modelos ({workers} hilos) ──[/bold]")
+
+        # Pre-crear el dict "tests" de cada host para que los hilos solo asignen
+        # claves distintas (seguro con el GIL) sin competir por crearlo.
+        for h in usables:
+            h.setdefault("tests", {})
+
         results = []
-        for i, (h, m) in enumerate(pairs, 1):
+        counter = {"done": 0}
+        lock = threading.Lock()
+
+        def do_one(pair):
+            h, m = pair
             if worker.is_cancelled:
-                break
-            res = fo.test_model(h["ip"], h["port"], m, 30.0, 12)
-            h.setdefault("tests", {})[m] = res
-            results.append((h, m, res))
+                return None
+            res = fo.test_model(h["ip"], h["port"], m, 30.0, 12,
+                                h.get("protocol", "ollama"))
+            h["tests"][m] = res
+            with lock:
+                counter["done"] += 1
+                i = counter["done"]
             if res["ok"]:
                 tps = res["tokens_per_sec"]
                 line = (f"[green]OK[/green] {h['ip']}:{h['port']}  {m}  "
@@ -368,6 +409,14 @@ class OllamaTUI(App):
             else:
                 line = f"[red]FALLO[/red] {h['ip']}:{h['port']}  {m}  ({res['error']})"
             self.call_from_thread(self.write_log, f"  [{i}/{total}] {line}")
+            return (h, m, res)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(do_one, p) for p in pairs]
+            for fut in concurrent.futures.as_completed(futures):
+                r = fut.result()
+                if r is not None:
+                    results.append(r)
         self.call_from_thread(self.after_test, results)
 
     def after_test(self, results):
@@ -433,6 +482,26 @@ class OllamaTUI(App):
         else:
             self.set_status("Filtro: mostrando [b]todos[/b] los modelos.")
             self.notify("Mostrando todos los modelos y servidores.")
+
+    def action_cycle_provider(self):
+        # Avanza al siguiente proveedor del ciclo (None = todos).
+        i = PROVIDER_CYCLE.index(self.provider_filter)
+        self.provider_filter = PROVIDER_CYCLE[(i + 1) % len(PROVIDER_CYCLE)]
+        self.model = None
+        self.host = None
+        self.query_one("#servers", ListView).clear()
+        self.populate_models(self.query_one("#filter", Input).value)
+        nombre = self.provider_filter or "todos"
+        n = len(self.query_one("#models", ListView).children)
+        # ¿Cuántos servidores hay de ese proveedor?
+        if self.provider_filter:
+            srv = sum(1 for h in self.hosts
+                      if h.get("provider", "ollama") == self.provider_filter)
+        else:
+            srv = len(self.hosts)
+        self.set_status(f"Proveedor: [b]{nombre}[/b] · {n} modelos, {srv} servidores. "
+                        f"Pulsa [p] para cambiar.")
+        self.notify(f"Proveedor: {nombre} ({srv} servidores).")
 
     def action_reset(self):
         self.messages = []
