@@ -169,8 +169,15 @@ class OllamaTUI(App):
         yield Footer()
 
     # ------------------------------------------------------------------ setup
+    def _update_header_provider(self):
+        """Refleja en la barra superior (sub_title del Header) el proveedor por
+        el que se está filtrando ahora mismo (None = todos)."""
+        nombre = self.provider_filter or "todos"
+        self.sub_title = f"Proveedor: {nombre}"
+
     def on_mount(self):
         self.title = "Ollama Scanner TUI"
+        self._update_header_provider()
         cached = fo.load_cache()
         if cached:
             self.hosts = cached
@@ -487,6 +494,7 @@ class OllamaTUI(App):
         # Avanza al siguiente proveedor del ciclo (None = todos).
         i = PROVIDER_CYCLE.index(self.provider_filter)
         self.provider_filter = PROVIDER_CYCLE[(i + 1) % len(PROVIDER_CYCLE)]
+        self._update_header_provider()
         self.model = None
         self.host = None
         self.query_one("#servers", ListView).clear()
