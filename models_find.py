@@ -6,13 +6,13 @@ Soporta varios proveedores (ver PROVIDERS): Ollama y servidores compatibles
 con la API de OpenAI (llama.cpp, vLLM, LocalAI, LM Studio, text-gen-webui).
 
 Uso:
-    python find_ollama.py [--limit N] [--no-probe] [--timeout S]
-    python find_ollama.py --update                 # refresca la caché desde Shodan
-    python find_ollama.py --providers ollama,vllm  # solo ciertos proveedores
-    python find_ollama.py --chat                   # chatea usando la caché
-    python find_ollama.py --test                   # prueba y mide velocidad
+    python models_find.py [--limit N] [--no-probe] [--timeout S]
+    python models_find.py --update                 # refresca la caché desde Shodan
+    python models_find.py --providers ollama,vllm  # solo ciertos proveedores
+    python models_find.py --chat                   # chatea usando la caché
+    python models_find.py --test                   # prueba y mide velocidad
 
-Los resultados se guardan en ollama_hosts.json. En modo --chat (o cualquier
+Los resultados se guardan en hosts.json. En modo --chat (o cualquier
 ejecución normal) se reutiliza esa caché si existe; con --update se vuelve a
 consultar Shodan y se sobrescribe el fichero. El flujo de chat es
 modelo-primero: eliges modelo y luego el servidor que lo ofrece.
@@ -77,7 +77,7 @@ SHODAN_QUERY = PROVIDERS["ollama"]["query"]
 
 # Fichero donde se cachean los resultados de la búsqueda.
 CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "ollama_hosts.json")
+                          "hosts.json")
 
 
 def save_cache(hosts: list, path: str = CACHE_FILE):
@@ -255,17 +255,104 @@ def chat_stream(host_url: str, model: str, messages: list, timeout: float,
     return "".join(full)
 
 
+# Categorías estables de error para poder agregar estadísticas. El texto libre
+# de `error`/`error_detail` varía entre servidores; `error_category` sí está
+# acotado a este conjunto, así que es lo que hay que usar para contar/agrupar.
+ERROR_CATEGORIES = {
+    "timeout":          "La petición superó el timeout",
+    "connection":       "No se pudo conectar (rechazada/DNS/red inalcanzable)",
+    "auth":             "Requiere API key o acceso restringido (401/403)",
+    "not_found":        "Modelo o endpoint inexistente (404)",
+    "rate_limit":       "Límite de peticiones o cuota agotada (429)",
+    "model_error":      "El modelo existe pero no se pudo cargar/ejecutar",
+    "bad_request":      "Petición rechazada por inválida (400)",
+    "server_error":     "Error interno del servidor (5xx)",
+    "invalid_response": "Respuesta no válida / no-JSON",
+    "other":            "Otro error no clasificado",
+}
+
+
+def _classify_http_status(status: int) -> str:
+    """Mapea un código HTTP de error a una categoría estable."""
+    if status in (401, 403):
+        return "auth"
+    if status == 404:
+        return "not_found"
+    if status == 429:
+        return "rate_limit"
+    if status == 400:
+        return "bad_request"
+    if 500 <= status < 600:
+        return "server_error"
+    return "other"
+
+
+def _classify_message(msg: str):
+    """Heurística sobre el texto de error del servidor para afinar la causa
+    (p. ej. distinguir 'falta API key' de 'modelo no cargado'). Devuelve una
+    categoría o None si no reconoce el mensaje."""
+    m = (msg or "").lower()
+    if not m:
+        return None
+    if any(k in m for k in ("api key", "api-key", "unauthorized", "authenticat",
+                            "forbidden", "permission", "not allowed", "access denied")):
+        return "auth"
+    if any(k in m for k in ("rate limit", "too many requests", "quota", "overloaded")):
+        return "rate_limit"
+    if any(k in m for k in ("not found", "no such model", "does not exist",
+                            "unknown model", "model not found", "try pulling")):
+        return "not_found"
+    if any(k in m for k in ("out of memory", "not loaded", "failed to load",
+                            "loading model", "runner", "no available", "cuda",
+                            "insufficient")):
+        return "model_error"
+    return None
+
+
+def _extract_server_error(data):
+    """Extrae el mensaje de error embebido en el cuerpo JSON de la respuesta,
+    tanto en formato Ollama ({"error": "..."}) como OpenAI
+    ({"error": {"message": "..."}}). Devuelve el texto o None."""
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not err:
+        return None
+    if isinstance(err, dict):
+        return err.get("message") or err.get("code") or str(err)
+    return str(err)
+
+
+def _fail(category: str, error, latency: float, http_status=None, detail=None):
+    """Construye un dict de resultado fallido homogéneo."""
+    res = {
+        "ok": False,
+        "error": str(error)[:100],       # resumen legible (retrocompatible)
+        "error_category": category,       # valor acotado para estadísticas
+        "latency": latency,
+    }
+    if http_status is not None:
+        res["http_status"] = http_status
+    if detail:
+        res["error_detail"] = str(detail)[:300]  # mensaje crudo del servidor
+    return res
+
+
 def test_model(ip: str, port: int, model: str, timeout: float, num_predict: int,
                protocol: str = "ollama"):
     """Envía una generación mínima a un modelo y mide su rendimiento.
 
     Devuelve un dict con:
-      ok            -> True/False
-      latency       -> tiempo total de la petición (s)
-      tokens_per_sec-> velocidad de generación (métricas del servidor si las
-                       hay; si no, tokens generados / latencia)
-      eval_count    -> nº de tokens generados
-      error         -> descripción si ok=False
+      ok             -> True/False
+      latency        -> tiempo total de la petición (s)
+      tokens_per_sec -> velocidad de generación (métricas del servidor si las
+                        hay; si no, tokens generados / latencia)
+      eval_count     -> nº de tokens generados
+    Y si ok=False:
+      error          -> resumen legible del fallo
+      error_category -> categoría estable (ver ERROR_CATEGORIES) para stats
+      http_status    -> código HTTP, si el fallo vino con respuesta
+      error_detail   -> mensaje crudo del servidor, si lo hubo
     """
     prompt = "Responde solo con la palabra: OK"
     if protocol == "openai":
@@ -287,18 +374,37 @@ def test_model(ip: str, port: int, model: str, timeout: float, num_predict: int,
     t0 = time.perf_counter()
     try:
         resp = requests.post(url, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
     except requests.exceptions.Timeout:
-        return {"ok": False, "error": "timeout", "latency": time.perf_counter() - t0}
+        return _fail("timeout", "timeout", time.perf_counter() - t0)
+    except requests.exceptions.ConnectionError as e:
+        return _fail("connection", f"conexión: {type(e).__name__}",
+                     time.perf_counter() - t0)
     except Exception as e:
-        return {"ok": False, "error": type(e).__name__, "latency": time.perf_counter() - t0}
+        return _fail("other", type(e).__name__, time.perf_counter() - t0)
 
     latency = time.perf_counter() - t0
-    if isinstance(data, dict) and data.get("error"):
-        err = data["error"]
-        msg = err.get("message") if isinstance(err, dict) else str(err)
-        return {"ok": False, "error": str(msg)[:60], "latency": latency}
+
+    # El cuerpo puede traer el detalle del error; lo intentamos parsear siempre.
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+    server_msg = _extract_server_error(data)
+
+    # Fallo por código HTTP (>=400). Afinamos con el mensaje si lo reconocemos.
+    if not resp.ok:
+        category = _classify_message(server_msg) or _classify_http_status(resp.status_code)
+        summary = server_msg or f"HTTP {resp.status_code} {resp.reason}"
+        return _fail(category, summary, latency,
+                     http_status=resp.status_code, detail=server_msg)
+
+    # 200 pero con error embebido (Ollama suele devolver 200 + {"error": ...}).
+    if server_msg:
+        category = _classify_message(server_msg) or "model_error"
+        return _fail(category, server_msg, latency, detail=server_msg)
+
+    if data is None:
+        return _fail("invalid_response", "respuesta no-JSON", latency)
 
     if protocol == "openai":
         # La API OpenAI no da tiempos de servidor; estimamos tok/s con la latencia.
@@ -384,9 +490,21 @@ def run_tests(hosts, timeout: float, num_predict: int, workers: int):
                   f"{r['ip']}:{r['port']}  {r['model']}")
 
     if ko:
+        # Desglose por categoría de error (para estadísticas).
+        by_cat = {}
+        for r in ko:
+            by_cat.setdefault(r.get("error_category", "other"), []).append(r)
+        print(f"\nFallos por categoría ({len(ko)} en total):")
+        for cat, rows in sorted(by_cat.items(), key=lambda kv: -len(kv[1])):
+            desc = ERROR_CATEGORIES.get(cat, cat)
+            print(f"  {len(rows):>4}  {cat:<16} {desc}")
+
         print(f"\nModelos que fallan ({len(ko)}):")
         for r in ko:
-            print(f"  - {r['ip']}:{r['port']}  {r['model']}  ({r['error']})")
+            cat = r.get("error_category", "?")
+            status = f" HTTP {r['http_status']}" if r.get("http_status") else ""
+            print(f"  - {r['ip']}:{r['port']}  {r['model']}  "
+                  f"[{cat}{status}] {r['error']}")
 
     return results
 

@@ -1,11 +1,11 @@
-# AI Scanner — Ollama
+# AI Models Scanner
 
 Herramienta para localizar servidores de IA expuestos (sin autenticación) con
 Shodan y trabajar con ellos. Soporta **Ollama** y servidores compatibles con
 la API de **OpenAI** (llama.cpp, vLLM, LocalAI, LM Studio, text-gen-webui).
 Incluye:
 
-- **[find_ollama.py](find_ollama.py)** — scanner de línea de comandos (búsqueda,
+- **[models_find.py](models_find.py)** — scanner de línea de comandos (búsqueda,
   pruebas de velocidad y chat).
 - **[tui.py](tui.py)** — interfaz de terminal (TUI) para hacer todo lo anterior
   de forma visual e interactiva.
@@ -40,16 +40,16 @@ puede sobrescribir con `--test-workers N`.
 
 ---
 
-## Scanner por línea de comandos (find_ollama.py)
+## Scanner por línea de comandos (models_find.py)
 
 ```bash
 source venv/bin/activate
-python find_ollama.py                 # lista desde la caché (o busca si no existe)
-python find_ollama.py --update        # fuerza nueva búsqueda en Shodan
-python find_ollama.py --limit 20      # nº máximo de resultados a procesar
-python find_ollama.py --no-probe      # solo datos de Shodan, sin contactar hosts
-python find_ollama.py --test          # prueba cada modelo y mide su velocidad
-python find_ollama.py --chat          # elige modelo y servidor e inicia un chat
+python models_find.py                 # lista desde la caché (o busca si no existe)
+python models_find.py --update        # fuerza nueva búsqueda en Shodan
+python models_find.py --limit 20      # nº máximo de resultados a procesar
+python models_find.py --no-probe      # solo datos de Shodan, sin contactar hosts
+python models_find.py --test          # prueba cada modelo y mide su velocidad
+python models_find.py --chat          # elige modelo y servidor e inicia un chat
 ```
 
 | Opción            | Descripción                                                     |
@@ -64,7 +64,7 @@ python find_ollama.py --chat          # elige modelo y servidor e inicia un chat
 | `--test-workers`  | Pruebas en paralelo en `--test` (def: 10).                      |
 | `--providers`     | Proveedores a buscar, separados por comas, o `all` (def: all).  |
 
-Los resultados se cachean en **`ollama_hosts.json`**. Cualquier ejecución
+Los resultados se cachean en **`hosts.json`**. Cualquier ejecución
 reutiliza esa caché; solo `--update` (o su ausencia inicial) consulta Shodan.
 Los datos de `--test` también se guardan, así que los colores de estado se
 mantienen entre ejecuciones.
@@ -85,14 +85,14 @@ endpoints `/v1/models` y `/v1/chat/completions`:
 | `tgwebui`    | OpenAI    | 5000   | text-generation-webui (oobabooga).          |
 
 ```bash
-python find_ollama.py --update --providers ollama,vllm,llamacpp   # solo estos
-python find_ollama.py --update --providers all                     # todos (def)
+python models_find.py --update --providers ollama,vllm,llamacpp   # solo estos
+python models_find.py --update --providers all                     # todos (def)
 ```
 
 > Las consultas de Shodan de algunos proveedores son aproximadas; la
 > confirmación real de que es un servidor válido y su lista de modelos se hace
 > al sondear el host en vivo. Puedes afinar las consultas editando el
-> diccionario `PROVIDERS` en [find_ollama.py](find_ollama.py).
+> diccionario `PROVIDERS` en [models_find.py](models_find.py).
 
 ---
 
@@ -129,10 +129,16 @@ python tui.py
 - **Chat**: registro con las respuestas renderizadas como **Markdown** (listas,
   tablas, código…) y streaming token a token.
 
+> La **barra superior** muestra en todo momento el proveedor por el que estás
+> filtrando (`Proveedor: todos` o el que elijas con `p`).
+
 ### Flujo de trabajo
 
 1. Pulsa **`u`** para buscar/actualizar servidores en Shodan (o se carga la caché).
-2. Pulsa **`t`** para probar todos los modelos y marcar en verde los que funcionan.
+2. Al iniciar, la disponibilidad y la velocidad se cargan de la caché y los pares
+   `(servidor, modelo)` aún sin probar se **miden solos en segundo plano**, así
+   que ya se ve qué funciona sin pulsar nada. Pulsa **`t`** para **re-probarlo
+   todo** cuando quieras refrescar los datos.
 3. Elige un **modelo** (`↑↓` + `Enter`) y luego un **servidor** (`↑↓` + `Enter`).
 4. Escribe abajo y pulsa `Enter` para chatear.
 
@@ -147,15 +153,16 @@ python tui.py
 | `Tab`        | Cambiar de panel                                             |
 | `F2` / `F3`  | Ir al filtro de modelos / a la caja de escribir             |
 | `u`          | Actualizar la lista desde Shodan                             |
-| `t`          | Probar los modelos y medir su velocidad                     |
+| `t`          | Re-probar todos los modelos y medir su velocidad            |
 | `o`          | Mostrar **solo disponibles** (verde) / todos                |
+| `p`          | Cambiar el proveedor por el que filtrar (se ve en la barra) |
 | `r`          | Reiniciar el contexto del chat                              |
 | `Ctrl+Y`     | Copiar la última respuesta del chat al portapapeles         |
 | `Ctrl+B`     | Copiar el modelo o servidor resaltado (o el par activo)     |
 | `Ctrl+L`     | Limpiar el registro                                         |
 | `q`          | Salir                                                        |
 
-> Las teclas de una sola letra (`u`, `t`, `o`, `r`, `q`) actúan cuando el foco
+> Las teclas de una sola letra (`u`, `t`, `o`, `p`, `r`, `q`) actúan cuando el foco
 > **no** está en una caja de texto. Si estás escribiendo, pulsa `Esc` primero.
 > Los atajos `Ctrl+…` funcionan también mientras escribes.
 

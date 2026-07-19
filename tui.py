@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interfaz TUI (Textual) para el buscador de servidores Ollama.
+"""Interfaz TUI (Textual) para AI Models Scanner: buscador de servidores de IA.
 
 Permite, desde una sola pantalla:
   - Cargar / actualizar la lista de servidores (Shodan)      -> tecla u
@@ -10,7 +10,7 @@ Permite, desde una sola pantalla:
 Uso:
     python tui.py
 
-Reutiliza la lógica de find_ollama.py (caché, Shodan, pruebas, streaming).
+Reutiliza la lógica de models_find.py (caché, Shodan, pruebas, streaming).
 """
 import concurrent.futures
 import threading
@@ -26,7 +26,7 @@ from textual.widgets import (
 )
 from textual.worker import get_current_worker
 
-import find_ollama as fo
+import models_find as fo
 
 
 def looks_like_markdown(text: str) -> bool:
@@ -74,7 +74,9 @@ class ServerItem(ListItem):
             n = len(host.get("live_models") or [])
             label = f"{base}  [dim]({n} mod{loc})[/dim]"
         elif not t.get("ok"):
-            label = (f"[red]{base}  ✗ FALLO ({t.get('error', '?')})[/red]"
+            cat = t.get("error_category")
+            reason = f"{cat}: {t.get('error', '?')}" if cat else t.get("error", "?")
+            label = (f"[red]{base}  ✗ FALLO ({reason})[/red]"
                      f"[dim]{loc}[/dim]")
         else:
             tps = t.get("tokens_per_sec")
@@ -176,7 +178,7 @@ class OllamaTUI(App):
         self.sub_title = f"Proveedor: {nombre}"
 
     def on_mount(self):
-        self.title = "Ollama Scanner TUI"
+        self.title = "AI Models Scanner"
         self._update_header_provider()
         cached = fo.load_cache()
         if cached:
@@ -203,6 +205,26 @@ class OllamaTUI(App):
             "[cyan]p[/cyan] proveedor (Ollama, vLLM, llama.cpp…)"
         )
         self.query_one("#prompt", Input).focus()
+        # Al iniciar, mide en segundo plano disponibilidad y velocidad de los
+        # pares (servidor, modelo) que aún no estén en caché, para que se vea
+        # qué funciona sin tener que pulsar [t] cada vez.
+        self._maybe_autotest()
+
+    def _maybe_autotest(self):
+        """Lanza la prueba incremental si hay pares sin resultado en caché."""
+        if self.bg_busy:
+            return
+        pending = sum(
+            1 for h in self.hosts for m in (h.get("live_models") or [])
+            if fo.get_test(h, m) is None
+        )
+        if not pending:
+            return
+        self.bg_busy = "test"
+        self.set_status(f"Midiendo en segundo plano {pending} modelos "
+                        f"(disponibilidad y velocidad)… [t] para relanzar todo.")
+        self.notify(f"Probando {pending} modelos en segundo plano…")
+        self.do_test(only_untested=True)
 
     def rebuild_index(self):
         """Reconstruye modelo -> servidores que lo ofrecen."""
@@ -376,13 +398,22 @@ class OllamaTUI(App):
                         f"{len(self.models)} modelos. Pulsa [t] para probar "
                         f"y marcar en verde los que funcionan.")
         self.notify("Lista actualizada desde Shodan y guardada en caché.")
+        # Mide automáticamente los pares nuevos sin resultado en caché.
+        self._maybe_autotest()
 
     @work(thread=True, exclusive=True, group="test")
-    def do_test(self):
+    def do_test(self, only_untested: bool = False):
         worker = get_current_worker()
         usables = [h for h in self.hosts if h.get("live_models")]
         pairs = [(h, m) for h in usables for m in h["live_models"]]
+        # Modo incremental: probar solo lo que aún no tenga resultado en caché.
+        # Así el arranque mide lo pendiente y, si ya está todo, no hace nada.
+        if only_untested:
+            pairs = [(h, m) for (h, m) in pairs if fo.get_test(h, m) is None]
         total = len(pairs)
+        if total == 0:
+            self.call_from_thread(self.after_test, [])
+            return
         workers = fo.env_test_threads()
         self.call_from_thread(
             self.write_log,
@@ -428,6 +459,12 @@ class OllamaTUI(App):
 
     def after_test(self, results):
         self.bg_busy = None
+        # Nada que probar (todo estaba en caché): refresca en silencio.
+        if not results:
+            self.populate_models(self.query_one("#filter", Input).value)
+            if self.model:
+                self.populate_servers(self.model)
+            return
         fo.save_cache(self.hosts)
         ok = [(h, m, r) for (h, m, r) in results if r["ok"]]
         ok.sort(key=lambda x: (x[2]["tokens_per_sec"] is None,
